@@ -1,10 +1,4 @@
-#![cfg_attr(RUSTC_WITH_SPECIALIZATION, feature(min_specialization))]
-#![allow(clippy::integer_arithmetic)]
-#[macro_use]
-extern crate solana_bpf_loader_program;
-
-mod structs;
-use structs::SlottedAccount;
+use crate::structs::SlottedAccount;
 use hex::{decode, encode};
 use solana_runtime::{
     message_processor::MessageProcessor,
@@ -47,7 +41,7 @@ use solana_program::{
     message::legacy::Message as LegacyMessage,
     message::MessageHeader,
 };
-use std::{cell::RefCell, rc::Rc, path::PathBuf, fs, env, collections::HashMap, io::prelude::*};
+use std::{cell::RefCell, rc::Rc, path::PathBuf, fs, collections::HashMap, io::prelude::*, slice, str};
 
 macro_rules! to_builtin {
     ($b:expr) => {
@@ -55,18 +49,40 @@ macro_rules! to_builtin {
     };
 }
 
+#[repr(C)]
+pub struct FilePaths {
+    paths: *const ByteSliceView,
+    count: usize,
+}
+
+impl FilePaths {
+    pub fn to_string_vec(&self) -> Vec<String> {
+        let ps: &[ByteSliceView] = unsafe { slice::from_raw_parts(self.paths, self.count) };
+        ps.iter().map(|p| p.to_string()).collect()
+    }
+}
+
+#[repr(C)]
+pub struct ByteSliceView {
+    ptr: *const u8,
+    len: usize,
+}
+
+impl ByteSliceView {
+    pub fn to_string(&self) -> String {
+        let bz: &[u8] = unsafe { slice::from_raw_parts(self.ptr, self.len) };
+        str::from_utf8(bz).unwrap().to_string()
+    }
+}
+
 // /Users/tonychen/repos/nitro-replayer/program.txt
 // /Users/tonychen/repos/nitro-replayer/owner.txt
-fn main() {
-    let args: Vec<String> = env::args().collect();
-    let account_file_paths: Vec<String> = args[1].split(",").map(|path| path.to_string()).collect();
-    let program_file_paths: Vec<String> = args[2].split(",").map(|path| path.to_string()).collect();
-    let tx_file_paths: Vec<String> = args[3].split(",").map(|path| path.to_string()).collect();
-    let output_directory: String = args[4].to_string();
-    let accounts: Vec<SlottedAccount> = account_file_paths.iter().map(|path| parse_account(path)).collect();
-    let programs: Vec<SlottedAccount> = program_file_paths.iter().map(|path| parse_account(path)).collect();
-    let txs: Vec<SanitizedTransaction> = tx_file_paths.iter().map(|path| parse_transaction(path)).collect();
-    process(&accounts, &programs, &txs, &output_directory);
+#[no_mangle]
+pub extern "C" fn replay(account_file_paths: FilePaths, program_file_paths: FilePaths, tx_file_paths: FilePaths, output_directory: ByteSliceView) {
+    let accounts: Vec<SlottedAccount> = account_file_paths.to_string_vec().iter().map(|path| parse_account(path)).collect();
+    let programs: Vec<SlottedAccount> = program_file_paths.to_string_vec().iter().map(|path| parse_account(path)).collect();
+    let txs: Vec<SanitizedTransaction> = tx_file_paths.to_string_vec().iter().map(|path| parse_transaction(path)).collect();
+    process(&accounts, &programs, &txs, &output_directory.to_string());
 }
 
 fn get_genesis_config() -> GenesisConfig {
@@ -76,13 +92,13 @@ fn get_genesis_config() -> GenesisConfig {
 fn get_validator_config(genesis_config: &GenesisConfig) -> ValidatorConfig {
     let ledger_path = PathBuf::from("/Users/tonychen/solana/ledger");
     let account_paths: Vec<PathBuf> = vec![ledger_path.join("accounts")];
-    let mut accounts_index_config = AccountsIndexConfig {
+    let accounts_index_config = AccountsIndexConfig {
         started_from_validator: true, // this is the only place this is set
         drives: Some(vec![ledger_path.join("accounts_index")]),
         ..AccountsIndexConfig::default()
     };
 
-    let mut accounts_db_config = AccountsDbConfig {
+    let accounts_db_config = AccountsDbConfig {
         index: Some(accounts_index_config),
         accounts_hash_cache_path: Some(ledger_path.clone()),
         ..AccountsDbConfig::default()
@@ -123,7 +139,7 @@ fn get_compute_budget(bank: &Bank, tx: &SanitizedTransaction) -> Option<ComputeB
             bank.feature_set.is_active(&default_units_per_instruction::id()),
             bank.feature_set.is_active(&add_set_compute_unit_price_ix::id()),
         );
-        if let Err(err) = process_transaction_result {
+        if let Err(_) = process_transaction_result {
             return None;
         }
     }

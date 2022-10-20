@@ -497,6 +497,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "cbindgen"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97449daf9b8c245bcad10bbc7c9f4a37c06172c18dd5f9fac340deefc309b957"
+dependencies = [
+ "clap",
+ "heck 0.3.3",
+ "indexmap",
+ "log",
+ "proc-macro2 1.0.46",
+ "quote 1.0.21",
+ "serde",
+ "serde_json",
+ "syn 1.0.102",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "cc"
 version = "1.0.73"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2238,6 +2257,7 @@ dependencies = [
 name = "nitro-replayer"
 version = "0.1.0"
 dependencies = [
+ "cbindgen",
  "clap",
  "hex",
  "serde",

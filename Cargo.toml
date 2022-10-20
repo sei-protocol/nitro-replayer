@@ -3,6 +3,9 @@ name = "nitro-replayer"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+crate-type = ["cdylib", "lib"]
+
 [dependencies]
 clap = "2.33.1"
 serde = "1.0.112"
@@ -15,3 +18,6 @@ solana-ledger = { git = "https://github.com/sei-protocol/solana", branch = "v1.1
 solana-bpf-loader-program = { git = "https://github.com/sei-protocol/solana", branch = "v1.10.26-nitro" }
 solana-program = { git = "https://github.com/sei-protocol/solana", branch = "v1.10.26-nitro" }
 solana-geyser-plugin-interface = { git = "https://github.com/sei-protocol/solana", branch = "v1.10.26-nitro" }
+
+[build-dependencies]
+cbindgen = "0.18.0"
