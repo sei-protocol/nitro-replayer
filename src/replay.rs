@@ -240,7 +240,7 @@ fn process(
             .zip(sanitized_txs.iter())
             .for_each(|(accs, tx)| match accs {
                 (Err(e), _nonce) => {
-                    panic!(e);
+                    panic!("{}", e);
                 },
                 (Ok(loaded_transaction), _) => {
                     let compute_budget = get_compute_budget(&bank, tx).unwrap();
