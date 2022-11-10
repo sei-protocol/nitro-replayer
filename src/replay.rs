@@ -240,10 +240,9 @@ fn process(
             .zip(sanitized_txs.iter())
             .for_each(|(accs, tx)| match accs {
                 (Err(e), _nonce) => {
-                    print!("load err {}\n", e);
+                    panic!(e);
                 },
                 (Ok(loaded_transaction), _) => {
-                    println!("start");
                     let compute_budget = get_compute_budget(&bank, tx).unwrap();
 
                     let executors = Rc::new(RefCell::new(Executors::default()));
@@ -292,8 +291,6 @@ fn process(
         let mut f = fs::File::create(format!("{}/{}", output_directory, k.to_string())).expect("failed to open file");
         f.write(serialize_account_data(k, v).as_bytes()).expect("failed to write");
     });
-    
-    println!("done");
 }
 
 fn parse_account(filepath: &str) -> SlottedAccount {
