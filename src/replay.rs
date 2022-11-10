@@ -1,3 +1,4 @@
+use std::mem;
 use crate::structs::SlottedAccount;
 use hex::{decode, encode};
 use solana_runtime::{
@@ -5,7 +6,6 @@ use solana_runtime::{
     bank::{Bank},
     accounts_index::{AccountsIndexConfig},
     accounts_db::{AccountsDbConfig},
-    builtins::{Builtins, Builtin},
     transaction_error_metrics::TransactionErrorMetrics,
     rent_collector::{RentCollector},
     ancestors::Ancestors,
@@ -43,12 +43,6 @@ use solana_program::{
 };
 use std::{cell::RefCell, rc::Rc, path::PathBuf, fs, collections::HashMap, io::prelude::*, slice, str};
 
-macro_rules! to_builtin {
-    ($b:expr) => {
-        Builtin::new(&$b.0, $b.1, $b.2)
-    };
-}
-
 #[repr(C)]
 pub struct FilePaths {
     paths: *const ByteSliceView,
@@ -56,6 +50,13 @@ pub struct FilePaths {
 }
 
 impl FilePaths {
+    pub fn from_vec(views: &[ByteSliceView]) -> Self {
+        Self {
+            paths: views.as_ptr(),
+            count: views.len(),
+        }
+    }
+
     pub fn to_string_vec(&self) -> Vec<String> {
         let ps: &[ByteSliceView] = unsafe { slice::from_raw_parts(self.paths, self.count) };
         ps.iter().map(|p| p.to_string()).collect()
@@ -69,6 +70,15 @@ pub struct ByteSliceView {
 }
 
 impl ByteSliceView {
+    pub fn from_str(string: &str) -> Self {
+        let s = String::from(string);
+        let s = mem::ManuallyDrop::new(s);
+        Self {
+            ptr: s.as_ptr(),
+            len: s.len(),
+        }
+    }
+
     pub fn to_string(&self) -> String {
         let bz: &[u8] = unsafe { slice::from_raw_parts(self.ptr, self.len) };
         str::from_utf8(bz).unwrap().to_string()
@@ -78,11 +88,18 @@ impl ByteSliceView {
 // /Users/tonychen/repos/nitro-replayer/program.txt
 // /Users/tonychen/repos/nitro-replayer/owner.txt
 #[no_mangle]
-pub extern "C" fn replay(account_file_paths: FilePaths, program_file_paths: FilePaths, tx_file_paths: FilePaths, output_directory: ByteSliceView) {
+pub extern "C" fn replay(
+    account_file_paths: FilePaths,
+    sysvar_file_paths: FilePaths,
+    program_file_paths: FilePaths,
+    tx_file_paths: FilePaths,
+    output_directory: ByteSliceView,
+) {
     let accounts: Vec<SlottedAccount> = account_file_paths.to_string_vec().iter().map(|path| parse_account(path)).collect();
+    let sysvar_accounts: Vec<SlottedAccount> = sysvar_file_paths.to_string_vec().iter().map(|path| parse_account(path)).collect();
     let programs: Vec<SlottedAccount> = program_file_paths.to_string_vec().iter().map(|path| parse_account(path)).collect();
     let txs: Vec<SanitizedTransaction> = tx_file_paths.to_string_vec().iter().map(|path| parse_transaction(path)).collect();
-    process(&accounts, &programs, &txs, &output_directory.to_string());
+    process(&accounts, &sysvar_accounts, &programs, &txs, &output_directory.to_string());
 }
 
 fn get_genesis_config() -> GenesisConfig {
@@ -148,44 +165,29 @@ fn get_compute_budget(bank: &Bank, tx: &SanitizedTransaction) -> Option<ComputeB
 
 fn process(
     accounts: &[SlottedAccount],
+    sysvar_accounts: &[SlottedAccount],
     programs: &[SlottedAccount],
     sanitized_txs: &[SanitizedTransaction],
     output_directory: &str,
 ) {
     let genesis_config = get_genesis_config();
     let validator_config = &get_validator_config(&genesis_config);
-    println!("initiating bank");
-    let bank = Bank::new_with_paths(
+    let bank = Bank::new_with_paths_for_replay(
         &genesis_config,
         validator_config.account_paths.clone(),
-        None,
-        Some(&Builtins {
-            genesis_builtins: vec![
-                to_builtin!(solana_bpf_loader_deprecated_program!()),
-                if validator_config.bpf_jit {
-                    to_builtin!(solana_bpf_loader_program_with_jit!())
-                } else {
-                    to_builtin!(solana_bpf_loader_program!())
-                },
-                if validator_config.bpf_jit {
-                    to_builtin!(solana_bpf_loader_upgradeable_program_with_jit!())
-                } else {
-                    to_builtin!(solana_bpf_loader_upgradeable_program!())
-                },
-            ],
-            feature_transitions: vec![],
-        }),
         validator_config.account_indexes.clone(),
         validator_config.accounts_db_caching_enabled,
         validator_config.accounts_shrink_ratio,
-        false,
         validator_config.accounts_db_config.clone(),
-        None,
+        sysvar_accounts.iter().map(|slotted_account| {
+            (slotted_account.pubkey.clone(), AccountSharedData::from(slotted_account.account.clone()))
+        }).collect(),
     );
+
+    let ancestors_sysvars: Vec<u64> = sysvar_accounts.iter().map(|account| account.slot).collect();
     let ancestors_accounts: Vec<u64> = accounts.iter().map(|account| account.slot).collect();
     let ancestors_programs: Vec<u64> = programs.iter().map(|account| account.slot).collect();
-    let ancestors = Ancestors::from([ancestors_accounts, ancestors_programs].concat());
-    println!("setting account data");
+    let ancestors = Ancestors::from([ancestors_sysvars, ancestors_accounts, ancestors_programs].concat());
     programs.iter()
         .for_each(|slotted_account| {
             let accounts = [(
@@ -202,12 +204,11 @@ fn process(
             )];
             bank.rc.accounts.accounts_db.store_uncached(slotted_account.slot, &accounts);
         });
-    let lock_results = bank.rc.accounts
-        .lock_accounts(sanitized_txs.iter(), &FeatureSet::all_enabled());
 
-    println!("registering hash");
-    sanitized_txs.iter().for_each(|tx| -> () {
-        match tx.message().clone() {
+    let mut new_account_data: HashMap<Pubkey, AccountSharedData> = HashMap::new();
+    sanitized_txs.iter().for_each(|sanitized_tx| {
+        let lock_results = bank.rc.accounts.lock_accounts([sanitized_tx.clone()].iter(), &FeatureSet::all_enabled());
+        match sanitized_tx.message().clone() {
             SanitizedMessage::Legacy(msg) => {
                 bank.blockhash_queue.write().unwrap().register_hash(&msg.recent_blockhash, bank.get_lamports_per_signature());
             },
@@ -215,86 +216,81 @@ fn process(
                 bank.blockhash_queue.write().unwrap().register_hash(&msg.message.recent_blockhash, bank.get_lamports_per_signature());
             },
         }
+        let mut error_counters = TransactionErrorMetrics::default();
+        let check_results = bank.check_transactions(
+            &[sanitized_tx.clone()],
+            &lock_results,
+            usize::MAX,
+            &mut error_counters,
+        );
+        let rent_collector = RentCollector::default();
+        let mut loaded_transactions = bank.rc.accounts.load_accounts(
+            &ancestors,
+            &[sanitized_tx.clone()],
+            check_results,
+            &bank.blockhash_queue.read().unwrap(),
+            &mut error_counters,
+            &rent_collector,
+            &bank.feature_set,
+            &bank.fee_structure,
+            None,
+        );
+        loaded_transactions
+            .iter_mut()
+            .zip(sanitized_txs.iter())
+            .for_each(|(accs, tx)| match accs {
+                (Err(e), _nonce) => {
+                    panic!(e);
+                },
+                (Ok(loaded_transaction), _) => {
+                    let compute_budget = get_compute_budget(&bank, tx).unwrap();
+
+                    let executors = Rc::new(RefCell::new(Executors::default()));
+
+                    let mut transaction_accounts = Vec::new();
+                    std::mem::swap(&mut loaded_transaction.accounts, &mut transaction_accounts);
+                    let mut transaction_context = TransactionContext::new(
+                        transaction_accounts,
+                        compute_budget.max_invoke_depth.saturating_add(1),
+                        tx.message().instructions().len(),
+                    );
+                    let (blockhash, lamports_per_signature) = bank.last_blockhash_and_lamports_per_signature();
+
+                    let mut executed_units = 0u64;
+
+                    MessageProcessor::process_message(
+                        &bank.builtin_programs.vec,
+                        tx.message(),
+                        &loaded_transaction.program_indices,
+                        &mut transaction_context,
+                        rent_collector.rent,
+                        None,
+                        executors.clone(),
+                        bank.feature_set.clone(),
+                        compute_budget,
+                        &mut ExecuteTimings::default(),
+                        &*bank.sysvar_cache.read().unwrap(),
+                        blockhash,
+                        lamports_per_signature,
+                        bank.load_accounts_data_size(),
+                        &mut executed_units,
+                    ).expect("process failed");
+
+                    let (accounts, _) = transaction_context.deconstruct();
+                    accounts.iter().for_each(|(pk, account)| {
+                        new_account_data.insert(pk.clone(), account.clone());
+                    });
+                }
+            });
+        bank.rc
+            .accounts
+            .unlock_accounts([sanitized_tx.clone()].iter(), &lock_results);
     });
-    let mut error_counters = TransactionErrorMetrics::default();
-    println!("checking txs");
-    let check_results = bank.check_transactions(
-        &sanitized_txs,
-        &lock_results,
-        usize::MAX,
-        &mut error_counters,
-    );
-    let rent_collector = RentCollector::default();
-    println!("loading accounts");
-    let mut loaded_transactions = bank.rc.accounts.load_accounts(
-        &ancestors,
-        &sanitized_txs,
-        check_results,
-        &bank.blockhash_queue.read().unwrap(),
-        &mut error_counters,
-        &rent_collector,
-        &bank.feature_set,
-        &bank.fee_structure,
-        None,
-    );
-
-    print!("processing {}\n", loaded_transactions.len());
-    let mut new_account_data: HashMap<Pubkey, AccountSharedData> = HashMap::new();
-    loaded_transactions
-        .iter_mut()
-        .zip(sanitized_txs.iter())
-        .for_each(|(accs, tx)| match accs {
-            (Err(e), _nonce) => {
-                print!("{}\n", e);
-            },
-            (Ok(loaded_transaction), _) => {
-                println!("start");
-                let compute_budget = get_compute_budget(&bank, tx).unwrap();
-
-                let executors = Rc::new(RefCell::new(Executors::default()));
-
-                let mut transaction_accounts = Vec::new();
-                std::mem::swap(&mut loaded_transaction.accounts, &mut transaction_accounts);
-                let mut transaction_context = TransactionContext::new(
-                    transaction_accounts,
-                    compute_budget.max_invoke_depth.saturating_add(1),
-                    tx.message().instructions().len(),
-                );
-                let (blockhash, lamports_per_signature) = bank.last_blockhash_and_lamports_per_signature();
-
-                let mut executed_units = 0u64;
-
-                MessageProcessor::process_message(
-                    &bank.builtin_programs.vec,
-                    tx.message(),
-                    &loaded_transaction.program_indices,
-                    &mut transaction_context,
-                    rent_collector.rent,
-                    None,
-                    executors.clone(),
-                    bank.feature_set.clone(),
-                    compute_budget,
-                    &mut ExecuteTimings::default(),
-                    &*bank.sysvar_cache.read().unwrap(),
-                    blockhash,
-                    lamports_per_signature,
-                    bank.load_accounts_data_size(),
-                    &mut executed_units,
-                ).expect("process failed");
-
-                let (accounts, _) = transaction_context.deconstruct();
-                accounts.iter().for_each(|(pk, account)| {
-                    new_account_data.insert(pk.clone(), account.clone());
-                });
-            }
-        });
 
     new_account_data.iter().for_each(|(k, v)| {
         let mut f = fs::File::create(format!("{}/{}", output_directory, k.to_string())).expect("failed to open file");
         f.write(serialize_account_data(k, v).as_bytes()).expect("failed to write");
     });
-    
-    println!("done");
 }
 
 fn parse_account(filepath: &str) -> SlottedAccount {
@@ -321,6 +317,7 @@ fn parse_account(filepath: &str) -> SlottedAccount {
 
 fn parse_transaction(filepath: &str) -> SanitizedTransaction {
     let content = fs::read_to_string(filepath).expect("failed to read file");
+    println!("{}", &content);
     let parts: Vec<&str> = content.split("\n").map(|part| part.trim() ).collect();
     let target = parts[0];
     let cols: Vec<&str> = target.split("|").map(|col| col.trim()).collect();
